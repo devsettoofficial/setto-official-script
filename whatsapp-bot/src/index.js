@@ -1,3 +1,4 @@
+import http from "http";
 import {
   makeWASocket,
   useMultiFileAuthState,
@@ -16,11 +17,30 @@ import {
   handleAntiDelete,
 } from "./lib/features.js";
 
+// ─── Bot status (updated by connection events) ──────────────────────────────
+const botStatus = { connected: false, user: null, startedAt: new Date().toISOString() };
+
+// ─── Status HTTP server (required so the run button works on Replit) ─────────
+const PORT = process.env.PORT ?? 8080;
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({
+    bot: config.botName,
+    author: "Setto Official",
+    status: botStatus.connected ? "connected" : "waiting_for_qr",
+    user: botStatus.user,
+    prefix: config.prefix,
+    uptime: process.uptime().toFixed(0) + "s",
+    startedAt: botStatus.startedAt,
+  }));
+});
+server.listen(PORT, () => log("info", `Status server running on port ${PORT}`));
+
+// ─── Bot core ────────────────────────────────────────────────────────────────
 async function startBot() {
   printBanner();
   log("info", "Starting WhatsApp bot...");
 
-  // Load or create session
   const { state, saveCreds } = await useMultiFileAuthState(config.sessionDir);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -32,14 +52,13 @@ async function startBot() {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, console),
     },
-    printQRInTerminal: false, // we print our own styled QR
+    printQRInTerminal: false,
     browser: ["Setto Bot", "Chrome", "1.0.0"],
     syncFullHistory: false,
   });
 
-  // ─── Connection Events ───────────────────────────────────────────────────
+  // ─── Connection Events ─────────────────────────────────────────────────
   sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    // Show QR code when not yet logged in
     if (qr) {
       log("info", "Scan the QR code below with WhatsApp:");
       console.log();
@@ -50,6 +69,7 @@ async function startBot() {
     if (connection === "close") {
       const code = (lastDisconnect?.error)?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
+      botStatus.connected = false;
 
       if (shouldReconnect) {
         log("warn", `Connection closed (code ${code}). Reconnecting...`);
@@ -61,33 +81,30 @@ async function startBot() {
     }
 
     if (connection === "open") {
-      log("success", `Bot connected! Logged in as: ${sock.user?.name ?? sock.user?.id}`);
+      botStatus.connected = true;
+      botStatus.user = sock.user?.name ?? sock.user?.id ?? "Unknown";
+      log("success", `Bot connected! Logged in as: ${botStatus.user}`);
       log("success", `Prefix: "${config.prefix}"  |  Bot: ${config.botName}`);
       log("success", "Ready to receive commands.");
     }
   });
 
-  // ─── Save session credentials ────────────────────────────────────────────
+  // ─── Save session ──────────────────────────────────────────────────────
   sock.ev.on("creds.update", saveCreds);
 
-  // ─── Incoming messages ───────────────────────────────────────────────────
+  // ─── Incoming messages ─────────────────────────────────────────────────
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
-
     for (const msg of messages) {
       if (!msg.message) continue;
-
-      // Cache every message for anti-delete
       cacheMessage(msg.key.id ?? "", msg.key.remoteJid ?? "", msg.message);
-
-      // Process commands
       await handleMessage(sock, msg).catch((err) =>
         log("error", `Message handler error: ${err.message}`)
       );
     }
   });
 
-  // ─── Anti-delete ─────────────────────────────────────────────────────────
+  // ─── Anti-delete ───────────────────────────────────────────────────────
   sock.ev.on("messages.delete", async (item) => {
     if (!("keys" in item)) return;
     for (const key of item.keys) {
@@ -96,14 +113,12 @@ async function startBot() {
     }
   });
 
-  // ─── Welcome / goodbye messages ──────────────────────────────────────────
+  // ─── Welcome / goodbye ─────────────────────────────────────────────────
   sock.ev.on("group-participants.update", async (update) => {
     if (update.action !== "add" && update.action !== "remove") return;
-
     const jids = update.participants.map((p) =>
       typeof p === "string" ? p : p.id
     );
-
     await handleWelcome(sock, update.id, jids, update.action).catch((err) =>
       log("error", `Group event error: ${err.message}`)
     );
@@ -112,7 +127,6 @@ async function startBot() {
   log("info", "All event listeners registered. Waiting for QR or session...");
 }
 
-// Start the bot
 startBot().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
